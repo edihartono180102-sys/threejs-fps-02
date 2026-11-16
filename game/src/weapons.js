@@ -1,7 +1,10 @@
-// The armoury: five guns and one grenade. Each weapon owns its numbers; main.js
-// owns the ray and the damage. Spread grows with movement and shrinks when aimed
-// down sights, so stopping to aim pays; a shotgun fires pellets, a sniper fires
-// one slow, punishing round. The grenade is a thrown projectile with a fuse.
+// The armoury: five guns and one grenade. Each weapon owns its numbers;
+// main.js owns the ray and the damage. Spread grows with movement and
+// shrinks when aimed down sights, so stopping to aim pays; on top of
+// that, firing in a long burst builds bloom — an extra spread that only
+// decays when the trigger is released — so tap-firing beats holding the
+// trigger down. A shotgun fires pellets, a sniper fires one slow,
+// punishing round. The grenade is a thrown projectile with a fuse.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
@@ -17,6 +20,12 @@ export const GRENADE = { name: 'Spark-1', price: 300, fuse: 1.6, radius: 9, dama
 export const ARMOR = { name: 'Kevlar', price: 650 };
 
 const GRAVITY = 20;
+// Bloom: each shot adds this much spread; it decays back to zero while
+// the trigger is up. A rifle's bloom per shot is small, a shotgun's is
+// large, so the punishment fits the weapon.
+const BLOOM_PER_SHOT = { pistol: 0.002, rifle: 0.0016, smg: 0.0012, shotgun: 0.009, sniper: 0.004 };
+const BLOOM_MAX = 0.03;
+const BLOOM_DECAY = 0.05; // spread per second of recovery
 
 export function createWeapons(camera) {
   const grip = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.slate), roughness: 0.7, metalness: 0.2 });
@@ -27,12 +36,12 @@ export function createWeapons(camera) {
   const models = {};
   function buildModel(def) {
     const g = new THREE.Group();
-    const L = def.kind === 'sniper' ? 0.62 : def.kind === 'shotgun' ? 0.55 : def.kind === 'smg' ? 0.34 : def.kind === 'rifle' ? 0.46 : 0.2;
-    const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.1, L), body);
-    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, L * 0.8), grip);
-    barrel.position.set(0, 0.03, -L * 0.75);
+    const length = def.kind === 'sniper' ? 0.62 : def.kind === 'shotgun' ? 0.55 : def.kind === 'smg' ? 0.34 : def.kind === 'rifle' ? 0.46 : 0.2;
+    const receiver = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.1, length), body);
+    const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, length * 0.8), grip);
+    barrel.position.set(0, 0.03, -length * 0.75);
     const stock = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.08, 0.2), def.kind === 'rifle' ? wood : grip);
-    stock.position.set(0, -0.02, L * 0.55);
+    stock.position.set(0, -0.02, length * 0.55);
     g.add(receiver, barrel, stock);
     if (def.kind === 'sniper') {
       const scope = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.22), grip);
@@ -46,7 +55,7 @@ export function createWeapons(camera) {
     }
     if (def.kind === 'shotgun') {
       const pump = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.06, 0.22), wood);
-      pump.position.set(0, -0.03, -L * 0.5);
+      pump.position.set(0, -0.03, -length * 0.5);
       g.add(pump);
     }
     g.position.set(0.24, -0.2, -0.42);
@@ -76,10 +85,12 @@ export function createWeapons(camera) {
     flash: 0,
     kick: 0,
     ads: 0, // 0 hip, 1 aimed
+    bloom: 0, // extra spread from firing in a burst
     grenades: 0,
     armor: false,
+    exploded: null,
   };
-  const thrown = []; // {pos, vel, fuse} — one grenade at a time is the rule.
+  const thrown = []; // {pos, vel, fuse} — one grenade in the air at a time.
   const grenadeMesh = new THREE.Mesh(
     new THREE.SphereGeometry(0.09, 10, 8),
     new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.accent), roughness: 0.4, metalness: 0.5 }),
@@ -87,20 +98,30 @@ export function createWeapons(camera) {
   grenadeMesh.visible = false;
   camera.parent.add(grenadeMesh);
 
+  // Walk cycle for the view-model bob, in seconds of walking.
+  let bobPhase = 0;
+
   function showModel() {
     for (const key of WEAPON_ORDER) models[key].visible = key === state.def.key;
   }
   showModel();
 
-  function step(dt, aiming) {
+  // step runs every rendered frame: timers, the view model, the grenade.
+  // `speed` is the carrier's ground speed, for the walk bob.
+  function step(dt, aiming, speed = 0) {
     state.cooldown = Math.max(0, state.cooldown - dt);
     state.flash = Math.max(0, state.flash - dt);
     state.kick += (0 - state.kick) * Math.min(1, dt * 14);
     state.ads += ((aiming ? 1 : 0) - state.ads) * Math.min(1, dt * 10);
+    // Bloom recovers only while the trigger is up (cooldown spent).
+    if (state.cooldown <= 0) state.bloom = Math.max(0, state.bloom - BLOOM_DECAY * dt);
     const model = models[state.def.key];
+    // Walk bob: the gun dips and sways with each step, less when aimed.
+    bobPhase += dt * speed * 1.6;
+    const bobAmp = Math.min(1, speed / 5) * 0.012 * (1 - state.ads * 0.7);
     model.position.z = -0.42 + state.kick;
-    model.position.x = 0.24 - state.ads * 0.24;
-    model.position.y = -0.2 + state.ads * 0.045;
+    model.position.x = 0.24 - state.ads * 0.24 + Math.sin(bobPhase * 2) * bobAmp * 0.5;
+    model.position.y = -0.2 + state.ads * 0.045 + Math.abs(Math.cos(bobPhase)) * bobAmp;
     model.rotation.x = state.kick * 2.2;
     flash.visible = state.flash > 0;
     flash.rotation.z = state.flash * 30;
@@ -149,6 +170,7 @@ export function createWeapons(camera) {
       state.cooldown = state.def.gap;
       state.flash = 0.06;
       state.kick = 0.04 + state.def.kick;
+      state.bloom = Math.min(BLOOM_MAX, state.bloom + (BLOOM_PER_SHOT[state.def.kind] ?? 0.002));
     },
     takeRound() {
       if (state.mag <= 0) return false;
@@ -159,9 +181,10 @@ export function createWeapons(camera) {
       if (state.reloadLeft > 0 || state.mag === state.def.mag || state.reserve === 0) return;
       state.reloadLeft = state.def.reload;
     },
+    // Spread now: base (still + movement) times the aim bonus, plus bloom.
     spread(speed) {
       const move = state.def.spreadStill + Math.min(1, speed / 5.2) * state.def.spreadMove;
-      return move * (1 - state.ads * 0.75);
+      return move * (1 - state.ads * 0.75) + state.bloom;
     },
     movePenalty() {
       return state.ads > 0.5 ? 0.55 : 1;
@@ -173,6 +196,7 @@ export function createWeapons(camera) {
       state.reserve = WEAPONS[key].reserve;
       state.cooldown = 0;
       state.reloadLeft = 0;
+      state.bloom = 0;
       showModel();
       return true;
     },
@@ -183,6 +207,7 @@ export function createWeapons(camera) {
       state.reloadLeft = 0;
       state.flash = 0;
       state.kick = 0;
+      state.bloom = 0;
     },
     throwGrenade(origin, direction) {
       if (state.grenades <= 0 || thrown.length > 0) return false;

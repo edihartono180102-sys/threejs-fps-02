@@ -1,14 +1,20 @@
-// DUSTLINE: the entry point. A fixed 60 Hz simulation, a renderer that reads
-// it, and the glue between the modules: firing and grenades, the buy menu,
-// the charge, the round clock, the kill feed, the camera, and the deterministic
-// capture mode (?shot=start|buy|play|end&seed=N) the screenshots are taken in.
+// DUSTLINE: the entry point. A fixed 60 Hz simulation, a renderer that
+// reads it, and the glue between the modules: firing and grenades, the
+// buy menu, the charge, the round clock, the kill feed, the camera, and
+// the deterministic capture mode (?shot=start|buy|play|end&seed=N) the
+// screenshots are taken in.
+//
+// The game state lives in one object (game) instead of a dozen loose
+// `let`s, so a round reset touches one place. Shooting reuses scratch
+// vectors instead of cloning a vector per pellet, and damage falloff
+// comes from combat.js instead of being recomputed inline.
 import * as THREE from 'three';
 import { createMap, SPAWNS, SITES } from './map.js';
 import { createPlayer } from './player.js';
 import { createBots } from './bots.js';
 import { createWeapons, WEAPONS } from './weapons.js';
-import { createEffects, damage, shootPellet, partMultiplier } from './combat.js';
-import { createBomb, BLAST_RADIUS } from './bomb.js';
+import { createEffects, damage, shootPellet, partMultiplier, falloffMultiplier } from './combat.js';
+import { createBomb } from './bomb.js';
 import { createRounds } from './rounds.js';
 import { createHud } from './hud.js';
 import { createInput } from './input.js';
@@ -20,6 +26,12 @@ const params = new URLSearchParams(location.search);
 const SHOT = params.get('shot');
 const SEED = Number(params.get('seed') || 1);
 const random = SHOT ? mulberry32(SEED) : Math.random;
+
+// Scratch vectors for shooting: one shot fires up to 8 pellets, and
+// none of them needs a fresh allocation.
+const shotFrom = new THREE.Vector3();
+const shotDir = new THREE.Vector3();
+const shotAim = new THREE.Vector3();
 
 const app = document.getElementById('app');
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -42,7 +54,7 @@ const effects = createEffects(scene);
 const audio = createAudio();
 const hud = createHud();
 const input = createInput(renderer.domElement, (locked) => {
-  if (!locked && started && !SHOT) hud.showOverlay('paused');
+  if (!locked && game.started && !SHOT) hud.showOverlay('paused');
   if (locked) hud.hideOverlay();
 });
 const playerCtl = createPlayer(world.colliders, scene);
@@ -61,39 +73,42 @@ const rounds = createRounds();
 const fighters = [player, ...bots.bots.map((b) => b.fighter)];
 const hitMeshes = [...world.shootables, ...playerCtl.hitMeshes, ...bots.hitMeshes];
 
-let started = false;
-let time = 0;
-let lastShot = null;
-let lastDryAt = -1;
-let spectate = null;
-let carrierTimer = -1;
+// One place for the match's mutable state.
+const game = {
+  started: false,
+  time: 0,
+  lastShot: null,
+  lastDryAt: -1,
+  spectate: null,
+  carrierTimer: -1,
+  primaryKey: 'vk47',
+  // Ammo lives per weapon, so switching back to a gun keeps its mag.
+  // The weapons module resets ammo on equip, so main.js saves and
+  // restores it around the call.
+  ammo: new Map(),
+};
 
-// Ammo lives per weapon, so switching back to a gun keeps its mag. The weapons
-// module resets ammo on equip, so main.js saves and restores it around the call.
-const ammoStore = {};
 function freshAmmo(key) {
   const def = WEAPONS[key];
   return { mag: def.mag, reserve: def.reserve };
 }
 function saveAmmo() {
   const s = weapons.state;
-  ammoStore[s.def.key] = { mag: s.mag, reserve: s.reserve };
+  game.ammo.set(s.def.key, { mag: s.mag, reserve: s.reserve });
 }
 function loadAmmo(key) {
   weapons.equip(key);
-  const entry = ammoStore[key];
+  const entry = game.ammo.get(key);
   if (entry) {
     weapons.state.mag = entry.mag;
     weapons.state.reserve = entry.reserve;
   }
 }
 function resetAmmo() {
-  for (const key of Object.keys(ammoStore)) delete ammoStore[key];
+  game.ammo.clear();
   loadAmmo('vk47');
 }
 loadAmmo('vk47');
-
-let primaryKey = 'vk47';
 
 const BUY_ITEMS = [
   { id: 'vk47', key: '1', name: 'VK-47', desc: 'Rifle · 30 rd · the workhorse', price: 2700 },
@@ -115,10 +130,10 @@ function buy(id) {
     if (player.armor > 0) return;
     player.armor = 50;
   } else {
-    if (primaryKey === item.id) return;
+    if (game.primaryKey === item.id) return;
     saveAmmo();
-    primaryKey = item.id;
-    ammoStore[item.id] = freshAmmo(item.id);
+    game.primaryKey = item.id;
+    game.ammo.set(item.id, freshAmmo(item.id));
     loadAmmo(item.id);
   }
   rounds.addMoney(-item.price);
@@ -153,9 +168,9 @@ function onKill(attacker, victim) {
   hud.killfeed(attacker, victim, false);
   if (victim === player) {
     player.alive = false;
-    spectate = bots.bots.find((b) => b.team === 'vanguard' && b.fighter.alive) || null;
-    hud.banner('YOU ARE DOWN', spectate ? `Spectating ${spectate.name}` : 'Round over');
-    if (bomb.state.carriedBy === 'player' && !bomb.state.planted) carrierTimer = 2;
+    game.spectate = bots.bots.find((b) => b.team === 'vanguard' && b.fighter.alive) || null;
+    hud.banner('YOU ARE DOWN', game.spectate ? `Spectating ${game.spectate.name}` : 'Round over');
+    if (bomb.state.carriedBy === 'player' && !bomb.state.planted) game.carrierTimer = 2;
   }
   checkRoundEnd();
 }
@@ -201,7 +216,7 @@ const botCtx = {
   effects,
   random,
   get lastShot() {
-    return lastShot;
+    return game.lastShot;
   },
   get bomb() {
     return bomb.state;
@@ -215,7 +230,7 @@ const botCtx = {
     bomb.state.planted = true;
     bomb.state.site = site;
     bomb.state.timer = 35;
-    bomb.state.beepAt = time;
+    bomb.state.beepAt = game.time;
     hud.banner('CHARGE PLANTED', `Site ${site} — 35 seconds`);
     audio.plantBeep(true);
     if (bomb.state.carriedBy === 'player') rounds.addMoney(300);
@@ -236,8 +251,8 @@ function startRound() {
   player.health = 100;
   player.alive = true;
   player.armor = player.armor > 0 ? 50 : 0;
-  spectate = null;
-  carrierTimer = -1;
+  game.spectate = null;
+  game.carrierTimer = -1;
   bots.resetRound(rounds.state.round, null);
   bomb.resetRound();
   rounds.beginRound();
@@ -256,7 +271,7 @@ function startRound() {
 function startMatch() {
   rounds.beginMatch();
   resetAmmo();
-  primaryKey = 'vk47';
+  game.primaryKey = 'vk47';
   weapons.state.grenades = 0;
   player.kills = 0;
   player.deaths = 0;
@@ -287,24 +302,22 @@ function playerShoot() {
   if (!weapons.ready() || !weapons.takeRound()) return;
   weapons.pullTrigger();
   const def = weapons.state.def;
-  const from = camera.position.clone();
-  from.x += Math.sin(player.yaw) * -0.25;
-  from.z += Math.cos(player.yaw) * -0.25;
-  from.y -= 0.12;
-  const dir = new THREE.Vector3();
-  camera.getWorldDirection(dir);
+  shotFrom.copy(camera.position);
+  shotFrom.x += Math.sin(player.yaw) * -0.25;
+  shotFrom.z += Math.cos(player.yaw) * -0.25;
+  shotFrom.y -= 0.12;
+  camera.getWorldDirection(shotDir);
   const spread = weapons.spread(playerCtl.groundSpeed());
   for (let p = 0; p < def.pellets; p += 1) {
-    const d = dir.clone();
-    d.x += (random() * 2 - 1) * spread;
-    d.y += (random() * 2 - 1) * spread;
-    d.z += (random() * 2 - 1) * spread;
-    d.normalize();
-    const hit = shootPellet(from, d, 80, hitMeshes);
-    effects.tracer(from, hit.point);
+    shotAim.copy(shotDir);
+    shotAim.x += (random() * 2 - 1) * spread;
+    shotAim.y += (random() * 2 - 1) * spread;
+    shotAim.z += (random() * 2 - 1) * spread;
+    shotAim.normalize();
+    const hit = shootPellet(shotFrom, shotAim, 80, hitMeshes);
+    effects.tracer(shotFrom, hit.point);
     if (hit.fighter && hit.fighter.team !== player.team) {
-      const falloff = Math.max(0.5, 1 - Math.max(0, hit.distance - def.falloff) / 40);
-      const amount = def.damage * partMultiplier(hit.part, def.headMult) * falloff;
+      const amount = def.damage * partMultiplier(hit.part, def.headMult) * falloffMultiplier(hit.distance, def.falloff);
       const killed = damage(hit.fighter, amount);
       onHit(player, hit.fighter, hit.part, killed);
       if (killed) onKill(player, hit.fighter);
@@ -312,7 +325,7 @@ function playerShoot() {
       effects.sparksAt(hit.point, random, 2);
     }
   }
-  lastShot = { x: player.position.x, z: player.position.z, at: time };
+  game.lastShot = { x: player.position.x, z: player.position.z, at: game.time };
   audio.shot(def.kind);
   playerCtl.recoil(def.kick * 0.012, (random() * 2 - 1) * def.kick * 0.004);
 }
@@ -325,22 +338,43 @@ function throwGrenade() {
   weapons.throwGrenade(from, dir);
 }
 
+// Spectate: while dead, V cycles to the next living teammate.
+function cycleSpectate() {
+  if (player.alive || !game.spectate) return;
+  const alive = bots.bots.filter((b) => b.team === 'vanguard' && b.fighter.alive);
+  if (alive.length === 0) return;
+  const at = alive.indexOf(game.spectate);
+  game.spectate = alive[(at + 1) % alive.length];
+  hud.banner('YOU ARE DOWN', `Spectating ${game.spectate.name}`);
+}
+
 // ----- simulation step -----
 function simStep() {
   const phase = rounds.state.phase;
   const pressed = input.takePressed();
   const look = input.takeLook();
-  if (player.alive && !spectate) playerCtl.look(look.x, look.y);
+  if (player.alive && !game.spectate) playerCtl.look(look.x, look.y);
   if (pressed.has('KeyB') && phase === 'buy' && player.alive) {
     hud.showBuy(document.getElementById('buy').hidden);
   }
   if (phase === 'buy' && player.alive) {
     for (const item of BUY_ITEMS) if (pressed.has(`Digit${item.key}`)) buy(item.id);
   }
+  // Outside the buy phase, 1/2 switch between sidearm and primary.
+  if (phase === 'live' && player.alive) {
+    if (pressed.has('Digit1') && weapons.state.def.key !== 'p9') {
+      saveAmmo();
+      loadAmmo('p9');
+    } else if (pressed.has('Digit2') && weapons.state.def.key !== game.primaryKey) {
+      saveAmmo();
+      loadAmmo(game.primaryKey);
+    }
+  }
   if (pressed.has('KeyG')) throwGrenade();
+  if (pressed.has('KeyV')) cycleSpectate();
   if (pressed.has('KeyQ')) {
     saveAmmo();
-    loadAmmo(weapons.state.def.key === 'p9' ? primaryKey : 'p9');
+    loadAmmo(weapons.state.def.key === 'p9' ? game.primaryKey : 'p9');
   }
 
   // Movement (never during the match-end overlay).
@@ -364,7 +398,7 @@ function simStep() {
   // The charge (player plant; bot plant/defuse runs in the bots' step).
   if (phase === 'live' && player.alive) {
     const progress = bomb.stepPlayer(STEP, player, input.state.keys, {
-      time,
+      time: game.time,
       audio,
       onPlanted: botCtx.onPlanted,
       onExploded: () => {
@@ -390,8 +424,8 @@ function simStep() {
   if (phase === 'live' && player.alive && input.state.firing) {
     if (weapons.state.mag > 0) {
       if (weapons.ready()) playerShoot();
-    } else if (time - lastDryAt > 0.3) {
-      lastDryAt = time;
+    } else if (game.time - game.lastDryAt > 0.3) {
+      game.lastDryAt = game.time;
       audio.dryFire();
     }
   }
@@ -402,9 +436,9 @@ function simStep() {
   }
 
   // Carrier pickup after the player falls.
-  if (carrierTimer > 0) {
-    carrierTimer -= STEP;
-    if (carrierTimer <= 0) {
+  if (game.carrierTimer > 0) {
+    game.carrierTimer -= STEP;
+    if (game.carrierTimer <= 0) {
       const carrier = bots.bots.find((b) => b.team === 'vanguard' && b.fighter.alive);
       if (carrier) {
         carrier.isCarrier = true;
@@ -415,7 +449,7 @@ function simStep() {
 
   // Bots run only once the round is live.
   if (phase === 'live') {
-    for (const bot of bots.bots) bots.step(bot, STEP, time, botCtx);
+    for (const bot of bots.bots) bots.step(bot, STEP, game.time, botCtx);
   }
 
   // A thrown grenade going off.
@@ -443,10 +477,10 @@ function simStep() {
   if (player.alive) {
     camera.position.set(player.position.x, player.position.y + player.eye, player.position.z);
     camera.rotation.set(player.pitch, player.yaw, 0);
-  } else if (spectate) {
-    const f = spectate.fighter;
+  } else if (game.spectate) {
+    const f = game.spectate.fighter;
     camera.position.set(f.position.x, f.position.y + 1.55, f.position.z);
-    camera.rotation.set(-0.05, spectate.yaw, 0);
+    camera.rotation.set(-0.05, game.spectate.yaw, 0);
   }
   const targetFov = aiming ? 55 : 75;
   if (Math.abs(camera.fov - targetFov) > 0.1) {
@@ -466,9 +500,9 @@ function simStep() {
   );
   hud.setBomb(bomb.state.planted, bomb.state.timer, bomb.state.site);
   hud.setSpread(4 + weapons.spread(playerCtl.groundSpeed()) * 900);
-  weapons.step(STEP, aiming);
+  weapons.step(STEP, aiming, playerCtl.groundSpeed());
   effects.step(STEP);
-  time += STEP;
+  game.time += STEP;
 }
 
 // ----- main loop -----
@@ -480,7 +514,7 @@ function frame(now) {
   if (frozen) return;
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
-  if (started) {
+  if (game.started) {
     acc += dt;
     let n = 0;
     while (acc >= STEP && n < 5) {
@@ -488,14 +522,14 @@ function frame(now) {
       acc -= STEP;
       n += 1;
     }
-    if (n === 5) acc = 0;
+    if (n === 5) acc = 0; // spiral-of-death guard: drop the backlog
   }
   renderer.render(scene, camera);
 }
 
 // ----- deterministic capture mode -----
 function capture(shot) {
-  started = true;
+  game.started = true;
   hud.hideOverlay();
   if (shot === 'start') {
     startMatch();
@@ -516,7 +550,7 @@ function capture(shot) {
     // The player may have been shot standing at spawn; bring them back.
     player.alive = true;
     player.health = 100;
-    spectate = null;
+    game.spectate = null;
     hud.hideBanner();
     hud.setHealth(100, player.armor);
     hud.setAlive(
@@ -537,6 +571,10 @@ function capture(shot) {
     endRound('vanguard', 'Charge detonated');
     camera.position.set(-14, 1.6, -8);
     camera.rotation.set(0, 0.9, 0);
+  } else {
+    // Unknown shot: fall back to the start screen instead of a black frame.
+    hud.showOverlay('start');
+    game.started = false;
   }
   // Two renders to settle the frame, then freeze and signal readiness.
   renderer.render(scene, camera);

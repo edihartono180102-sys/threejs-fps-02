@@ -1,13 +1,17 @@
-// Combat: the hitscan ray, the bodies it can hit, and what a hit looks like.
-// A fighter is a post, a torso and a head: the head takes the head multiplier,
-// the legs take less. Armour absorbs half of a hit until its 50 points are
-// spent. Tracers and sparks are pooled, never allocated in a firefight.
+// Combat: the hitscan ray, the bodies it can hit, and what a hit looks
+// like. A fighter is a post, a torso and a head: the head takes the head
+// multiplier, the legs take less. Armour absorbs half of a hit until its
+// 50 points are spent. Tracers and sparks are pooled and handed out
+// round-robin, so a firefight never allocates and never scans the pool
+// for a free slot.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
 const LEG_MULT = 0.75;
 const TRACER_COUNT = 12;
+const TRACER_LIFE = 0.06;
 const SPARK_COUNT = 24;
+const BLAST_LIFE = 0.5;
 
 export function createFighter(scene, team, name) {
   const color = team === 'vanguard' ? PALETTE.vanguard : PALETTE.ember;
@@ -46,7 +50,7 @@ export function createFighter(scene, team, name) {
 }
 
 export function createEffects(scene) {
-  // Tracers: pooled line segments, one per shot, fading in 60 ms.
+  // Tracers: pooled line segments, one per shot, fading fast.
   const tracers = [];
   for (let i = 0; i < TRACER_COUNT; i += 1) {
     const geo = new THREE.BufferGeometry();
@@ -57,6 +61,7 @@ export function createEffects(scene) {
     scene.add(line);
     tracers.push({ line, left: 0 });
   }
+  let tracerNext = 0;
   // Sparks: pooled small boxes with velocity and a short life.
   const sparks = [];
   const sparkGeo = new THREE.BoxGeometry(0.05, 0.05, 0.05);
@@ -67,6 +72,7 @@ export function createEffects(scene) {
     scene.add(m);
     sparks.push({ mesh: m, vel: new THREE.Vector3(), left: 0 });
   }
+  let sparkNext = 0;
   // One explosion: an expanding shell and a light, reused every blast.
   const shell = new THREE.Mesh(
     new THREE.SphereGeometry(1, 18, 12),
@@ -78,29 +84,29 @@ export function createEffects(scene) {
   scene.add(blastLight);
   let blast = 0;
 
-  const origin = new THREE.Vector3();
-  const hitPoint = new THREE.Vector3();
   return {
     tracer(from, to) {
-      const t = tracers.find((x) => x.left <= 0) ?? tracers[0];
+      const t = tracers[tracerNext];
+      tracerNext = (tracerNext + 1) % TRACER_COUNT;
       const pos = t.line.geometry.attributes.position.array;
       pos[0] = from.x; pos[1] = from.y; pos[2] = from.z;
       pos[3] = to.x; pos[4] = to.y; pos[5] = to.z;
       t.line.geometry.attributes.position.needsUpdate = true;
       t.line.material.opacity = 0.85;
       t.line.visible = true;
-      t.left = 0.06;
+      t.left = TRACER_LIFE;
     },
     sparksAt(point, random, count = 6) {
       let made = 0;
-      for (const s of sparks) {
-        if (s.left > 0) continue;
+      for (let n = 0; n < SPARK_COUNT && made < count; n += 1) {
+        const s = sparks[sparkNext];
+        sparkNext = (sparkNext + 1) % SPARK_COUNT;
+        if (s.left > 0) continue; // still flying: leave it, take the next slot
         s.mesh.position.copy(point);
         s.vel.set((random() - 0.5) * 6, random() * 5 + 1, (random() - 0.5) * 6);
         s.left = 0.35 + random() * 0.2;
         s.mesh.visible = true;
         made += 1;
-        if (made >= count) break;
       }
     },
     explosion(point) {
@@ -109,15 +115,14 @@ export function createEffects(scene) {
       shell.scale.setScalar(0.5);
       blastLight.position.copy(point).y += 1;
       blastLight.intensity = 60;
-      blast = 0.5;
-      origin.copy(point);
+      blast = BLAST_LIFE;
     },
     step(dt) {
       for (const t of tracers) {
         if (t.left <= 0) continue;
         t.left -= dt;
         if (t.left <= 0) t.line.visible = false;
-        else t.line.material.opacity = (t.left / 0.06) * 0.85;
+        else t.line.material.opacity = (t.left / TRACER_LIFE) * 0.85;
       }
       for (const s of sparks) {
         if (s.left <= 0) continue;
@@ -128,22 +133,18 @@ export function createEffects(scene) {
       }
       if (blast > 0) {
         blast -= dt;
-        const k = 1 - blast / 0.5;
+        const k = 1 - blast / BLAST_LIFE;
         shell.scale.setScalar(0.5 + k * 8);
         shell.material.opacity = Math.max(0, 0.7 * (1 - k));
         blastLight.intensity = Math.max(0, 60 * (1 - k));
         if (blast <= 0) shell.visible = false;
       }
     },
-    muzzle(out) {
-      return out;
-    },
-    _origin: origin,
-    _hitPoint: hitPoint,
   };
 }
 
-// Apply damage to a fighter. Returns true when the hit kills.
+// Apply damage to a fighter. Armour takes half the hit until its points
+// run out; the rest goes to health. Returns true when the hit kills.
 export function damage(fighter, amount) {
   if (!fighter.alive) return false;
   let rest = amount;
@@ -162,7 +163,8 @@ export function damage(fighter, amount) {
   return false;
 }
 
-// One hitscan pellet. Returns {fighter, part, point, distance} or a wall hit.
+// One hitscan pellet. Returns {fighter, part, point, distance}; when
+// nothing is hit, the point is the ray's end at full range.
 const raycaster = new THREE.Raycaster();
 export function shootPellet(origin, direction, range, hitMeshes) {
   raycaster.set(origin, direction);
@@ -182,4 +184,11 @@ export function partMultiplier(part, headMult) {
   if (part === 'head') return headMult;
   if (part === 'legs') return LEG_MULT;
   return 1;
+}
+
+// Damage falls off with distance: full up to `falloff` metres, then
+// linear down to half at `falloff` + 40 m, never below half.
+export function falloffMultiplier(distance, falloff) {
+  if (distance <= falloff) return 1;
+  return Math.max(0.5, 1 - (distance - falloff) / 40);
 }

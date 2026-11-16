@@ -1,9 +1,11 @@
-// The bots: nine of them, four on your side, five against. Each one has a
-// skill (reaction, accuracy, burst), an assignment (a lane and a job), and a
-// small state machine: move along the waypoint graph, hold an angle, engage
-// what it sees, plant or defuse the charge. They see through a vision cone
-// with a line-of-sight test, they hear gunfire, and they strafe and burst
-// their fire like a player would — they never snap-aim through a wall.
+// The bots: nine of them, four on your side, five against. Each one has
+// a skill tier (reaction, accuracy, burst size), an assignment (a lane
+// and a job), and a small state machine: move along the waypoint graph,
+// hold an angle, engage what it sees, peek a corner it lost its enemy
+// behind, plant or defuse the charge. They see through a vision cone
+// with a line-of-sight test, they hear gunfire, they carry a magazine
+// and must reload like a player, and they strafe and burst their fire
+// like a player would — they never snap-aim through a wall.
 import * as THREE from 'three';
 import { createFighter, damage, shootPellet, partMultiplier } from './combat.js';
 import { createMover } from './player.js';
@@ -19,6 +21,16 @@ const EYE_HEIGHT = 1.55;
 const VISION_RANGE = 42;
 const VISION_HALF_ANGLE = 1.05; // ~60 degrees each side
 const HEAR_RANGE = 26;
+const PEEK_SECONDS = 1.5; // how long a bot watches a corner it lost its enemy behind
+
+// Skill tiers, from the bot's 0..1 skill roll: reaction delay, burst
+// size and aim error. A veteran reacts in a blink and holds its fire
+// in long bursts; a rookie hesitates and sprays.
+function profileFor(skill) {
+  if (skill >= 0.75) return { react: 0.28, burstMin: 4, burstMax: 7, aimErr: 0.008 };
+  if (skill >= 0.55) return { react: 0.4, burstMin: 3, burstMax: 5, aimErr: 0.012 };
+  return { react: 0.55, burstMin: 2, burstMax: 4, aimErr: 0.018 };
+}
 
 function angleTo(from, to) {
   return Math.atan2(-(to.x - from.x), -(to.z - from.z));
@@ -48,6 +60,7 @@ export function createBots(scene, colliders, random) {
       team,
       name,
       skill, // 0..1: higher is faster and more accurate
+      profile: profileFor(skill),
       def: WEAPONS[defKey],
       yaw: spawn[2],
       state: 'move',
@@ -55,6 +68,7 @@ export function createBots(scene, colliders, random) {
       pathIndex: 0,
       holdNode: -1,
       holdYaw: 0,
+      holdJitter: 0, // a fresh angle offset each round, so holds never repeat exactly
       lane: 'mid',
       role: 'entry',
       enemy: null,
@@ -62,10 +76,13 @@ export function createBots(scene, colliders, random) {
       lastSeenAt: -99,
       lastHeard: null,
       lastHeardAt: -99,
+      peekUntil: 0,
       reactAt: 0,
       burstLeft: 0,
       burstAt: 0,
       shotAt: 0,
+      ammo: WEAPONS[defKey].mag, // bots reload like players do
+      reloadUntil: 0,
       strafeDir: 1,
       strafeAt: 0,
       plantProgress: 0,
@@ -105,12 +122,17 @@ export function createBots(scene, colliders, random) {
       b.holdNode = holds[i % holds.length];
       b.role = 'hold';
       b.lane = i < 2 ? 'A' : i === 2 ? 'mid' : 'B';
+      // A fresh hold angle each round: the same corner, a different stare.
+      b.holdJitter = (random() - 0.5) * 0.5;
     });
   }
 
   function resetRound(round, carrier) {
+    const seen = { vanguard: 0, ember: 0 };
     for (const bot of bots) {
-      const spawn = SPAWNS[bot.team][bots.filter((x) => x.team === bot.team).indexOf(bot) % SPAWNS[bot.team].length];
+      const teamIndex = seen[bot.team];
+      seen[bot.team] += 1;
+      const spawn = SPAWNS[bot.team][teamIndex % SPAWNS[bot.team].length];
       bot.fighter.position.set(spawn[0], 0, spawn[1]);
       bot.fighter.group.position.copy(bot.fighter.position);
       bot.fighter.group.rotation.set(0, 0, 0);
@@ -130,18 +152,21 @@ export function createBots(scene, colliders, random) {
       bot.plantProgress = 0;
       bot.defuseProgress = 0;
       bot.isCarrier = false;
+      bot.ammo = bot.def.mag;
+      bot.reloadUntil = 0;
+      bot.peekUntil = 0;
+      bot.burstLeft = 0;
     }
     assignRound(round, carrier);
   }
 
   // Where this bot wants to be when it has nothing to shoot at.
   function objectiveNode(bot, bomb) {
+    if (bomb.planted) return nearestSiteNode(bomb.site);
     if (bot.team === 'vanguard') {
-      if (bomb.planted) return nearestSiteNode(bomb.site);
       if (bot.isCarrier) return bot.lane === 'B' ? 15 : 14; // the charge goes to a site, never to mid
       return bot.lane === 'A' ? 11 : bot.lane === 'B' ? 12 : 8;
     }
-    if (bomb.planted) return nearestSiteNode(bomb.site);
     return bot.holdNode >= 0 ? bot.holdNode : 13;
   }
   function nearestSiteNode(site) {
@@ -155,7 +180,7 @@ export function createBots(scene, colliders, random) {
   }
 
   // The nearest living enemy this bot can actually see.
-  function visibleEnemy(bot, fighters, colliders, time) {
+  function visibleEnemy(bot, fighters, time) {
     let best = null;
     let bestD = Infinity;
     for (const f of fighters) {
@@ -178,18 +203,26 @@ export function createBots(scene, colliders, random) {
 
   function fireAt(bot, target, ctx, time) {
     const def = bot.def;
+    // A dry magazine means a reload pause, not infinite fire.
+    if (bot.ammo <= 0) {
+      if (bot.reloadUntil === 0) bot.reloadUntil = time + def.reload;
+      if (time < bot.reloadUntil) return false;
+      bot.ammo = def.mag;
+      bot.reloadUntil = 0;
+    }
     if (time < bot.shotAt) return false;
     bot.shotAt = time + def.gap;
+    bot.ammo -= 1;
     const from = bot.fighter.position.clone();
     from.y += 1.35;
     from.x += Math.sin(bot.yaw) * -0.3;
     from.z += Math.cos(bot.yaw) * -0.3;
-    // Aim at the chest, sometimes the head; spread by skill and distance.
+    // Aim at the chest, sometimes the head; error by tier and distance.
     const aimY = 1.05 + (bot.skill > 0.7 && ctx.random() < 0.3 ? 0.5 : 0);
     const to = target.position.clone();
     to.y += aimY;
     const dir = to.sub(from).normalize();
-    const spread = (0.028 - bot.skill * 0.018) * (1 + target.position.distanceTo(bot.fighter.position) / 30);
+    const spread = bot.profile.aimErr * (1 + target.position.distanceTo(bot.fighter.position) / 30);
     for (let p = 0; p < def.pellets; p += 1) {
       const d = dir.clone();
       d.x += (ctx.random() * 2 - 1) * spread;
@@ -223,19 +256,21 @@ export function createBots(scene, colliders, random) {
     }
     f.group.rotation.x = 0;
     // Senses.
-    const seen = visibleEnemy(bot, ctx.fighters, ctx.colliders, time);
+    const seen = visibleEnemy(bot, ctx.fighters, time);
     if (seen) {
       bot.enemy = seen.fighter;
       bot.lastSeen = seen.fighter.position.clone();
       bot.lastSeenAt = time;
       if (bot.state !== 'engage') {
         bot.state = 'engage';
-        bot.reactAt = time + 0.55 - bot.skill * 0.3 + ctx.random() * 0.15;
+        bot.reactAt = time + bot.profile.react + ctx.random() * 0.15;
         bot.burstLeft = 0;
       }
     } else if (bot.enemy && time - bot.lastSeenAt > 1.2) {
+      // Lost them behind a corner: peek the last seen spot before giving up.
       bot.enemy = null;
-      bot.state = 'move';
+      bot.state = 'peek';
+      bot.peekUntil = time + PEEK_SECONDS;
       bot.path = [];
     }
     // Hearing: a shot nearby pulls the bot toward it.
@@ -265,7 +300,7 @@ export function createBots(scene, colliders, random) {
       f.group.rotation.y = bot.yaw;
       if (time >= bot.reactAt) {
         if (bot.burstLeft <= 0) {
-          bot.burstLeft = 3 + Math.floor(ctx.random() * 3);
+          bot.burstLeft = bot.profile.burstMin + Math.floor(ctx.random() * (bot.profile.burstMax - bot.profile.burstMin + 1));
           bot.burstAt = time + 0.6 + ctx.random() * 0.6;
         } else if (time >= bot.burstAt) {
           if (fireAt(bot, bot.enemy, ctx, time)) {
@@ -273,6 +308,18 @@ export function createBots(scene, colliders, random) {
             if (bot.burstLeft <= 0) bot.burstAt = time + 0.6 + ctx.random() * 0.6;
           }
         }
+      }
+      return;
+    }
+
+    if (bot.state === 'peek' && bot.lastSeen) {
+      // Stand still and watch the corner; if nothing shows, move on.
+      const targetYaw = angleTo(f.position, bot.lastSeen);
+      bot.yaw = turnToward(bot.yaw, targetYaw, dt * 6);
+      f.group.rotation.y = bot.yaw;
+      if (time >= bot.peekUntil) {
+        bot.state = 'move';
+        bot.path = [];
       }
       return;
     }
@@ -322,8 +369,8 @@ export function createBots(scene, colliders, random) {
       const hz = NODES[bot.holdNode][1];
       if (Math.hypot(hx - f.position.x, hz - f.position.z) < 1.2) {
         bot.state = 'hold';
-        const holdYaw = bot.lane === 'A' ? Math.PI * 0.75 : bot.lane === 'B' ? Math.PI * 1.25 : Math.PI;
-        bot.yaw = turnToward(bot.yaw, holdYaw, dt * 3);
+        const baseYaw = bot.lane === 'A' ? Math.PI * 0.75 : bot.lane === 'B' ? Math.PI * 1.25 : Math.PI;
+        bot.yaw = turnToward(bot.yaw, baseYaw + bot.holdJitter, dt * 3);
         return;
       }
     }
