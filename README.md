@@ -35,23 +35,31 @@ node serve.ts
 - **Map — DUSTLINE YARD, 56×40 m.** Three lanes cross a mid wall to two bomb
   sites. Crates are crouch cover, containers block sight standing, the long
   sightline through mid doors is broken by a teal container.
-- **Economy.** Start $800; kill +$300, round win +$3,250, round loss +$1,900
-  (+$500 per consecutive loss, max two), plant +$300.
+- **Economy.** Start $800; kill +$300, round win +$3,250 (plus a small win-
+  streak bonus), round loss +$1,900 (+$500 per consecutive loss, max three),
+  plant +$300. A loss streak deepens the payout, so comebacks stay possible.
 - **Arsenal.** P9 pistol, VK-47 rifle, Hornet-9 SMG, Breacher-12 shotgun,
   Longbow-7 sniper, Spark-1 frag grenade, Kevlar. Headshots ×3 (shotgun ×2),
-  legs ×0.75, damage falloff past each weapon's range, spread that grows with
-  movement and shrinks when aimed, recoil and kick.
-- **Bots.** Nine of them with skill (reaction, accuracy, burst), lane
-  assignments, waypoint paths, vision cones with line-of-sight tests, hearing,
-  strafing, burst fire, site holds, rotations on a plant, and a carrier who
-  plants when you fall.
+  legs ×0.75, damage falloff past each weapon's range, spread that grows
+  with sustained fire and shrinks when aimed, recoil and kick, view-model
+  bob and sway.
+- **Bots.** Nine of them with skill tiers (reaction, accuracy, burst),
+  magazines and reloads, lane assignments, A* waypoint paths, vision cones
+  with line-of-sight tests, hearing, strafing, burst fire, site holds,
+  a 1.5 s peek when they lose their target, rotations on a plant, and a
+  carrier who plants when you fall.
 - **The charge.** Plant by holding E for 3 s in a site; 35 s timer with
-  quickening beeps; detonation wins the round for Vanguard. Defenders hold E
-  for 5 s to defuse.
-- **Presentation.** Desert dusk palette, shadows, fog, a full HUD (health and
-  armor, ammo, money, timer, round score, alive pips, kill feed, hit marker,
-  damage direction, buy menu, round banner, match scoreboard), and synthesized
-  Web Audio sound — no audio files ship with the game.
+  quickening beeps; detonation wins the round for Vanguard. Defenders hold
+  E for 5 s to defuse. Blast damage falls off quadratically, so standing
+  on the charge is fatal and the far corner is merely painful.
+- **Movement.** Acceleration and friction, crouch, jump with coyote time
+  and a buffered press, and step-up onto knee-high ledges instead of
+  bumping into them.
+- **Presentation.** Desert dusk palette, shadows, fog, a full HUD (health
+  and armor, ammo with a low-magazine warning, money, timer, round score,
+  alive pips, kill feed, hit marker, damage direction, buy menu, round
+  banner, match scoreboard), and synthesized Web Audio sound — no audio
+  files ship with the game.
 
 ## Architecture
 
@@ -59,26 +67,26 @@ Fixed 60 Hz simulation in `game/src/main.js`, one state per module, rendering
 reads state, no per-frame allocations in the hot loops:
 
 - `map.js` — the yard, colliders, sites, spawns, waypoint graph
-- `nav.js` — BFS paths, exact 2D line-of-sight test
-- `player.js` — movement, collision, hitboxes (shared mover for bots)
+- `nav.js` — A* paths with a binary heap, exact 2D line-of-sight test
+- `player.js` — movement, step-up, coyote time, hitboxes (shared mover for bots)
 - `bots.js` — the AI state machine
 - `weapons.js` — the armoury, view models, grenade flight
 - `combat.js` — fighters, hitscan, damage, pooled tracers and sparks
 - `bomb.js` — plant / timer / defuse / blast
-- `rounds.js` — phases, score, economy
+- `rounds.js` — phases, score, streak economy, round history
 - `hud.js` — the DOM HUD and buy menu
-- `input.js` — keyboard, mouse, pointer lock
-- `audio.js` — synthesized sound
-- `rng.js` — seeded random (mulberry32)
+- `input.js` — keyboard, mouse, pointer lock, sensitivity
+- `audio.js` — synthesized sound as step lists
+- `rng.js` — seeded random (mulberry32) plus int, range, bell draws
 
 ## Screenshots
 
 Deterministic captures, `?shot=<name>&seed=1`:
 
-1. `1-start.jpg` — the yard from the attacker spawn
-2. `2-buy.jpg` — the buy menu at round start
-3. `3-play.jpg` — mid-round, bots fighting down the A connector
-4. `4-end.jpg` — round won at Site A
+1. `1-start.png` — the yard from the attacker spawn
+2. `2-buy.png` — the buy menu at round start
+3. `3-play.png` — mid-round, bots fighting down the A connector
+4. `4-end.png` — round won at Site A
 
 ## Entry
 

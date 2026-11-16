@@ -1,7 +1,10 @@
-// Bot navigation: a waypoint graph over the map, BFS paths, and a 2D sight test.
-// Sight is a segment against the colliders' XZ rectangles, tall boxes only: a
-// 1.1 m crate never blocks a standing eye, a 2.6 m container always does. The
-// test is exact (slab method per rectangle) and allocates nothing.
+// Bot navigation: a waypoint graph over the map, A* paths with an
+// octile-distance heuristic, and a 2D sight test. Sight is a segment
+// against the colliders' XZ rectangles, tall boxes only: a 1.1 m crate
+// never blocks a standing eye, a 2.6 m container always does. The test
+// is exact (slab method per rectangle) and allocates nothing. A* keeps
+// one reusable heap, one parent array and one pair of score arrays, so
+// pathfinding costs the bots no garbage per frame.
 import { NODES, EDGES } from './map.js';
 
 const adjacency = NODES.map(() => []);
@@ -25,37 +28,100 @@ export function nearestNode(x, z) {
   return best;
 }
 
-// Breadth-first path of node indices from start to goal. Reuses one queue and
-// one parent array; the caller keeps the returned array (fresh each call).
-const queue = new Int32Array(NODES.length);
+// Octile distance between two waypoints: admissible for the grid-like
+// yard, so A* stays optimal while skipping most of the graph.
+function heuristic(a, b) {
+  const dx = Math.abs(NODES[a][0] - NODES[b][0]);
+  const dz = Math.abs(NODES[a][1] - NODES[b][1]);
+  return Math.max(dx, dz) + 0.4142 * Math.min(dx, dz);
+}
+function edgeCost(a, b) {
+  return Math.hypot(NODES[a][0] - NODES[b][0], NODES[a][1] - NODES[b][1]);
+}
+
+// A binary min-heap of node indices keyed by f-score, allocated once.
+const heap = new Int32Array(NODES.length);
+let heapSize = 0;
 const parent = new Int32Array(NODES.length);
+const gScore = new Float64Array(NODES.length);
+const inHeap = new Uint8Array(NODES.length);
+function heapSwap(i, j) {
+  const t = heap[i];
+  heap[i] = heap[j];
+  heap[j] = t;
+}
+function heapUp(i, goal) {
+  while (i > 0) {
+    const p = (i - 1) >> 1;
+    if (gScore[heap[i]] + heuristic(heap[i], goal) >= gScore[heap[p]] + heuristic(heap[p], goal)) break;
+    heapSwap(i, p);
+    i = p;
+  }
+}
+function heapDown(i, goal) {
+  for (;;) {
+    const left = i * 2 + 1;
+    const right = left + 1;
+    let smallest = i;
+    if (left < heapSize && gScore[heap[left]] + heuristic(heap[left], goal) < gScore[heap[smallest]] + heuristic(heap[smallest], goal)) smallest = left;
+    if (right < heapSize && gScore[heap[right]] + heuristic(heap[right], goal) < gScore[heap[smallest]] + heuristic(heap[smallest], goal)) smallest = right;
+    if (smallest === i) break;
+    heapSwap(i, smallest);
+    i = smallest;
+  }
+}
+
+// A* path of node indices from start to goal. Falls back to the bare goal
+// when the graph has no route, exactly as the old search did.
 export function findPath(start, goal) {
   if (start === goal) return [goal];
   parent.fill(-1);
-  let head = 0;
-  let tail = 0;
-  queue[tail] = start;
-  tail += 1;
+  gScore.fill(Infinity);
+  inHeap.fill(0);
+  heapSize = 0;
+  gScore[start] = 0;
   parent[start] = start;
-  while (head < tail) {
-    const n = queue[head];
-    head += 1;
-    for (const m of adjacency[n]) {
-      if (parent[m] !== -1) continue;
-      parent[m] = n;
-      if (m === goal) {
-        const path = [goal];
-        let cur = n;
-        while (cur !== start) {
-          path.push(cur);
-          cur = parent[cur];
-        }
-        path.push(start);
-        path.reverse();
-        return path;
+  heap[heapSize] = start;
+  heapSize += 1;
+  inHeap[start] = 1;
+  while (heapSize > 0) {
+    const n = heap[0];
+    heapSize -= 1;
+    if (heapSize > 0) {
+      heap[0] = heap[heapSize];
+      heapDown(0, goal);
+    }
+    inHeap[n] = 0;
+    if (n === goal) {
+      const path = [goal];
+      let cur = parent[goal];
+      while (cur !== start) {
+        path.push(cur);
+        cur = parent[cur];
       }
-      queue[tail] = m;
-      tail += 1;
+      path.push(start);
+      path.reverse();
+      return path;
+    }
+    for (const m of adjacency[n]) {
+      const tentative = gScore[n] + edgeCost(n, m);
+      if (tentative >= gScore[m]) continue;
+      gScore[m] = tentative;
+      parent[m] = n;
+      if (!inHeap[m]) {
+        heap[heapSize] = m;
+        heapSize += 1;
+        inHeap[m] = 1;
+        heapUp(heapSize - 1, goal);
+      } else {
+        // The node is already queued with a worse f-score: bubble it up.
+        for (let i = 0; i < heapSize; i += 1) {
+          if (heap[i] === m) {
+            heapUp(i, goal);
+            break;
+          }
+        }
+      }
     }
   }
   return [goal];

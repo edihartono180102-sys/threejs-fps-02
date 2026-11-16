@@ -1,8 +1,9 @@
 // The DOM HUD: crosshair, hit marker, health, ammo, money, timer, score,
 // alive counts, kill feed, damage direction, buy menu, round banner and the
 // overlays. It never touches the simulation; main.js pushes numbers in and
-// reads the play and buy callbacks out. Every setter is cheap and cached, so
-// it costs nothing per frame.
+// reads the play and buy callbacks out. Every setter is cheap and cached,
+// so it costs nothing per frame. When the magazine runs low the ammo
+// number turns ember, so a glance says reload before the click does.
 const COPY = {
   start: { title: 'DUSTLINE', copy: 'Five on five in the yard. Plant the charge at A or B — or drop every Ember before the clock runs out.', action: 'Click to play' },
   paused: { title: 'DUSTLINE', copy: 'Paused. Click to resume.', action: 'Click to resume' },
@@ -10,169 +11,213 @@ const COPY = {
   match: { title: '', copy: '', action: 'Play again' },
 };
 
+// [handle, element id] — one table instead of a long literal, so a missing
+// id fails in one place with a clear name.
+const ELEMENTS = [
+  ['overlay', 'overlay'], ['title', 'overlay-title'], ['copy', 'overlay-copy'], ['play', 'play'],
+  ['keys', 'keys-list'], ['hud', 'hud'], ['crosshair', 'crosshair'], ['hitmarker', 'hitmarker'],
+  ['vignette', 'vignette'], ['damageArc', 'damage-arc'],
+  ['health', 'health-value'], ['healthBar', 'health-fill'], ['armorBar', 'armor-fill'],
+  ['ammoMag', 'ammo-mag'], ['ammoReserve', 'ammo-reserve'], ['weaponName', 'weapon-name'],
+  ['grenades', 'grenades'], ['money', 'money'], ['timer', 'timer'], ['timerLabel', 'timer-label'],
+  ['scoreV', 'score-v'], ['scoreE', 'score-e'], ['aliveV', 'alive-v'], ['aliveE', 'alive-e'],
+  ['killfeed', 'killfeed'], ['banner', 'banner'], ['bannerTitle', 'banner-title'], ['bannerSub', 'banner-sub'],
+  ['buy', 'buy'], ['buyMoney', 'buy-money'], ['buyItems', 'buy-items'],
+  ['bomb', 'bomb'], ['bombTimer', 'bomb-timer'], ['bombLabel', 'bomb-label'],
+  ['plant', 'plant'], ['plantFill', 'plant-fill'], ['plantLabel', 'plant-label'],
+  ['board', 'board'], ['boardRows', 'board-rows'],
+];
+
 export function createHud() {
-  const $ = (id) => document.getElementById(id);
-  const els = {
-    overlay: $('overlay'), title: $('overlay-title'), copy: $('overlay-copy'), play: $('play'),
-    keys: $('keys-list'), hud: $('hud'), crosshair: $('crosshair'), hitmarker: $('hitmarker'),
-    vignette: $('vignette'), damageArc: $('damage-arc'),
-    health: $('health-value'), healthBar: $('health-fill'), armorBar: $('armor-fill'),
-    ammoMag: $('ammo-mag'), ammoReserve: $('ammo-reserve'), weaponName: $('weapon-name'),
-    grenades: $('grenades'), money: $('money'), timer: $('timer'), timerLabel: $('timer-label'),
-    scoreV: $('score-v'), scoreE: $('score-e'), aliveV: $('alive-v'), aliveE: $('alive-e'),
-    killfeed: $('killfeed'), banner: $('banner'), bannerTitle: $('banner-title'), bannerSub: $('banner-sub'),
-    buy: $('buy'), buyMoney: $('buy-money'), buyItems: $('buy-items'),
-    bomb: $('bomb'), bombTimer: $('bomb-timer'), bombLabel: $('bomb-label'),
-    plant: $('plant'), plantFill: $('plant-fill'), plantLabel: $('plant-label'),
-    board: $('board'), boardRows: $('board-rows'),
-  };
-  let last = {};
+  const el = {};
+  for (const [handle, id] of ELEMENTS) {
+    const node = document.getElementById(id);
+    if (!node) throw new Error(`DUSTLINE HUD is missing #${id}`);
+    el[handle] = node;
+  }
+  const seen = new Map(); // last text per key: writing the same string twice is free
   let hitTimer = 0;
   let bannerTimer = 0;
   let vignetteTimer = 0;
 
-  function setText(el, key, value) {
-    if (last[key] !== value) {
-      last[key] = value;
-      el.textContent = value;
+  function text(node, key, value) {
+    if (seen.get(key) !== value) {
+      seen.set(key, value);
+      node.textContent = value;
     }
+  }
+  function dots(alive) {
+    return '●'.repeat(alive) + '○'.repeat(5 - alive);
   }
 
   return {
     setHealth(hp, armor) {
-      setText(els.health, 'hp', String(Math.ceil(hp)));
-      const pct = Math.max(0, hp);
-      if (last.hppct !== pct) {
-        last.hppct = pct;
-        els.healthBar.style.width = `${pct}%`;
-        els.healthBar.style.background = pct > 50 ? 'var(--accent)' : pct > 25 ? '#e07b39' : '#d2542e';
+      text(el.health, 'hp', String(Math.ceil(hp)));
+      const hpPct = Math.max(0, hp);
+      if (seen.get('hppct') !== hpPct) {
+        seen.set('hppct', hpPct);
+        el.healthBar.style.width = `${hpPct}%`;
+        el.healthBar.style.background = hpPct > 50 ? 'var(--accent)' : hpPct > 25 ? '#e07b39' : '#d2542e';
       }
-      const apct = Math.max(0, armor);
-      if (last.apct !== apct) {
-        last.apct = apct;
-        els.armorBar.style.width = `${apct * 2}%`;
+      const apPct = Math.max(0, armor);
+      if (seen.get('apct') !== apPct) {
+        seen.set('apct', apPct);
+        el.armorBar.style.width = `${apPct * 2}%`;
       }
     },
     setAmmo(mag, reserve, weapon, grenades) {
-      setText(els.ammoMag, 'mag', String(mag));
-      setText(els.ammoReserve, 'res', `/ ${reserve}`);
-      setText(els.weaponName, 'wpn', weapon);
-      setText(els.grenades, 'gr', grenades > 0 ? `◉ ${grenades}` : '');
+      text(el.ammoMag, 'mag', String(mag));
+      text(el.ammoReserve, 'res', `/ ${reserve}`);
+      text(el.weaponName, 'wpn', weapon);
+      text(el.grenades, 'gr', grenades > 0 ? `◉ ${grenades}` : '');
+      // A nearly dry magazine turns ember: reload before the click.
+      const low = mag > 0 && mag <= 6;
+      el.ammoMag.style.color = mag === 0 || low ? 'var(--ember)' : '';
     },
     setMoney(n) {
-      setText(els.money, 'money', `$${n}`);
-      setText(els.buyMoney, 'bmoney', `$${n}`);
+      text(el.money, 'money', `$${n}`);
+      text(el.buyMoney, 'bmoney', `$${n}`);
     },
     setTimer(seconds, phase) {
       const s = Math.max(0, Math.ceil(seconds));
-      setText(els.timer, 'timer', `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`);
-      setText(els.timerLabel, 'tlabel', phase === 'buy' ? 'BUY' : phase === 'live' ? 'ROUND' : '');
+      text(el.timer, 'timer', `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`);
+      text(el.timerLabel, 'tlabel', phase === 'buy' ? 'BUY' : phase === 'live' ? 'ROUND' : '');
     },
     setScore(v, e) {
-      setText(els.scoreV, 'sv', String(v));
-      setText(els.scoreE, 'se', String(e));
+      text(el.scoreV, 'sv', String(v));
+      text(el.scoreE, 'se', String(e));
     },
     setAlive(v, e) {
-      setText(els.aliveV, 'av', '●'.repeat(v) + '○'.repeat(5 - v));
-      setText(els.aliveE, 'ae', '●'.repeat(e) + '○'.repeat(5 - e));
+      text(el.aliveV, 'av', dots(v));
+      text(el.aliveE, 'ae', dots(e));
     },
     setSpread(gapPx) {
-      els.crosshair.style.setProperty('--gap', `${gapPx.toFixed(1)}px`);
+      el.crosshair.style.setProperty('--gap', `${gapPx.toFixed(1)}px`);
     },
     hitMarker(killed) {
-      els.hitmarker.classList.add('on');
-      els.hitmarker.style.transform = killed ? 'translate(-50%, -50%) rotate(45deg) scale(1.3)' : '';
+      el.hitmarker.classList.add('on');
+      el.hitmarker.style.transform = killed ? 'translate(-50%, -50%) rotate(45deg) scale(1.3)' : '';
       clearTimeout(hitTimer);
       hitTimer = setTimeout(() => {
-        els.hitmarker.classList.remove('on');
-        els.hitmarker.style.transform = '';
+        el.hitmarker.classList.remove('on');
+        el.hitmarker.style.transform = '';
       }, killed ? 220 : 90);
     },
     damageFrom(angleDeg) {
-      els.damageArc.style.transform = `translate(-50%, -50%) rotate(${angleDeg.toFixed(0)}deg)`;
-      els.damageArc.classList.add('on');
-      els.vignette.classList.add('on');
+      el.damageArc.style.transform = `translate(-50%, -50%) rotate(${angleDeg.toFixed(0)}deg)`;
+      el.damageArc.classList.add('on');
+      el.vignette.classList.add('on');
       clearTimeout(vignetteTimer);
       vignetteTimer = setTimeout(() => {
-        els.damageArc.classList.remove('on');
-        els.vignette.classList.remove('on');
+        el.damageArc.classList.remove('on');
+        el.vignette.classList.remove('on');
       }, 450);
     },
     killfeed(killer, victim, headshot) {
       const row = document.createElement('div');
       row.className = 'feed-row';
-      row.innerHTML = `<b class="${killer.team}">${killer.name}</b> ${headshot ? '◉' : '—'} <b class="${victim.team}">${victim.name}</b>`;
-      els.killfeed.prepend(row);
-      while (els.killfeed.children.length > 5) els.killfeed.lastChild.remove();
+      const killerName = document.createElement('b');
+      killerName.className = killer.team;
+      killerName.textContent = killer.name;
+      const victimName = document.createElement('b');
+      victimName.className = victim.team;
+      victimName.textContent = victim.name;
+      row.append(killerName, document.createTextNode(headshot ? ' ◉ ' : ' — '), victimName);
+      el.killfeed.prepend(row);
+      while (el.killfeed.children.length > 5) el.killfeed.lastChild.remove();
       setTimeout(() => row.remove(), 6000);
     },
     banner(title, sub = '') {
-      els.bannerTitle.textContent = title;
-      els.bannerSub.textContent = sub;
-      els.banner.classList.add('on');
+      el.bannerTitle.textContent = title;
+      el.bannerSub.textContent = sub;
+      el.banner.classList.add('on');
       clearTimeout(bannerTimer);
-      bannerTimer = setTimeout(() => els.banner.classList.remove('on'), 2600);
+      bannerTimer = setTimeout(() => el.banner.classList.remove('on'), 2600);
     },
     hideBanner() {
       clearTimeout(bannerTimer);
-      els.banner.classList.remove('on');
+      el.banner.classList.remove('on');
     },
     setBomb(planted, timer, site) {
       if (planted) {
-        els.bomb.hidden = false;
-        setText(els.bombTimer, 'bt', `${timer.toFixed(1)}`);
-        setText(els.bombLabel, 'bl', `CHARGE AT ${site}`);
+        el.bomb.hidden = false;
+        text(el.bombTimer, 'bt', `${timer.toFixed(1)}`);
+        text(el.bombLabel, 'bl', `CHARGE AT ${site}`);
       } else {
-        els.bomb.hidden = true;
+        el.bomb.hidden = true;
       }
     },
     setPlant(progress, label) {
       if (progress > 0) {
-        els.plant.hidden = false;
-        els.plantFill.style.width = `${Math.round(progress * 100)}%`;
-        setText(els.plantLabel, 'pl', label);
+        el.plant.hidden = false;
+        el.plantFill.style.width = `${Math.round(progress * 100)}%`;
+        text(el.plantLabel, 'pl', label);
       } else {
-        els.plant.hidden = true;
+        el.plant.hidden = true;
       }
     },
     // Buy menu: rows are built once; buying is a click or a number key.
     buildBuy(items, onBuy) {
-      els.buyItems.innerHTML = '';
+      el.buyItems.innerHTML = '';
       for (const item of items) {
         const row = document.createElement('button');
         row.type = 'button';
         row.className = 'buy-row';
-        row.innerHTML = `<span class="buy-key">${item.key}</span><span class="buy-name">${item.name}</span><span class="buy-desc">${item.desc}</span><span class="buy-price">$${item.price}</span>`;
+        const key = document.createElement('span');
+        key.className = 'buy-key';
+        key.textContent = item.key;
+        const name = document.createElement('span');
+        name.className = 'buy-name';
+        name.textContent = item.name;
+        const desc = document.createElement('span');
+        desc.className = 'buy-desc';
+        desc.textContent = item.desc;
+        const price = document.createElement('span');
+        price.className = 'buy-price';
+        price.textContent = `$${item.price}`;
+        row.append(key, name, desc, price);
         row.addEventListener('click', () => onBuy(item.id));
-        els.buyItems.appendChild(row);
+        el.buyItems.appendChild(row);
       }
     },
     showBuy(show) {
-      els.buy.hidden = !show;
+      el.buy.hidden = !show;
     },
     showOverlay(mode, data = {}) {
-      const text = COPY[mode];
+      const copy = COPY[mode];
       if (mode === 'match') {
-        els.title.textContent = data.title;
-        els.copy.textContent = data.copy;
-        els.board.hidden = false;
-        els.boardRows.innerHTML = data.rows.map((r) => `<div class="board-row"><b class="${r.team}">${r.name}</b><span>${r.kills} kills</span><span>${r.deaths} deaths</span></div>`).join('');
+        el.title.textContent = data.title;
+        el.copy.textContent = data.copy;
+        el.board.hidden = false;
+        el.boardRows.innerHTML = '';
+        for (const r of data.rows) {
+          const row = document.createElement('div');
+          row.className = 'board-row';
+          const name = document.createElement('b');
+          name.className = r.team;
+          name.textContent = r.name;
+          const kills = document.createElement('span');
+          kills.textContent = `${r.kills} kills`;
+          const deaths = document.createElement('span');
+          deaths.textContent = `${r.deaths} deaths`;
+          row.append(name, kills, deaths);
+          el.boardRows.appendChild(row);
+        }
       } else {
-        els.board.hidden = true;
-        els.title.textContent = text.title;
-        els.copy.textContent = mode === 'dead' ? text.copy : text.copy;
-        if (mode === 'start') els.keys.hidden = false;
-        else els.keys.hidden = true;
+        el.board.hidden = true;
+        el.title.textContent = copy.title;
+        el.copy.textContent = copy.copy;
+        el.keys.hidden = mode !== 'start';
       }
-      els.play.textContent = text.action;
-      els.overlay.hidden = false;
-      els.play.focus();
+      el.play.textContent = copy.action;
+      el.overlay.hidden = false;
+      el.play.focus();
     },
     hideOverlay() {
-      els.overlay.hidden = true;
+      el.overlay.hidden = true;
     },
     onPlay(handler) {
-      els.play.addEventListener('click', handler);
+      el.play.addEventListener('click', handler);
     },
   };
 }
