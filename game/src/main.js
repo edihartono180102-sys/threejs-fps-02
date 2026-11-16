@@ -192,6 +192,9 @@ function endRound(team, reason) {
   hud.banner(won ? 'ROUND WON' : 'ROUND LOST', reason);
   if (won) audio.roundWin();
   else audio.roundLose();
+  if (rounds.state.matchPoint && !rounds.state.matchWinner) {
+    setTimeout(() => hud.banner('MATCH POINT', 'Win this round and take the match'), 2700);
+  }
   if (rounds.state.matchWinner) {
     setTimeout(() => showMatchEnd(), 2500);
   }

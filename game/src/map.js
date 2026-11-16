@@ -4,53 +4,14 @@
 // All collision is axis-aligned boxes, so the player, the bots and the bullets
 // share one collider list. Heights are chosen so a 1.1 m crate is cover when
 // crouched, a 2.6 m container blocks sight standing, and the 4.6 m walls never do.
+//
+// The geometry below is built from named helpers — wall, container, crate,
+// pillar — instead of one long table, so each piece says what it is and its
+// height is fixed by its kind. Every coordinate matches the original layout
+// exactly: the waypoint graph, the spawns and the sites were tuned against
+// these positions, and moving a single box would break a bot lane.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
-
-// [width, height, depth, x, yCentre, z, material]
-const BOXES = [
-  // Floor and the four outer walls.
-  [57, 0.4, 41, 0, -0.2, 0, 'sand'],
-  [0.4, 4.6, 41, -28.2, 2.3, 0, 'concrete'],
-  [0.4, 4.6, 41, 28.2, 2.3, 0, 'concrete'],
-  [57, 4.6, 0.4, 0, 2.3, -20.2, 'concrete'],
-  [57, 4.6, 0.4, 0, 2.3, 20.2, 'concrete'],
-  // Mid wall (z = 0) with three gaps: A connector, mid doors, B connector.
-  [3, 4.6, 0.6, -26.5, 2.3, 0, 'slate'],
-  [18.5, 4.6, 0.6, -11.75, 2.3, 0, 'slate'],
-  [18.5, 4.6, 0.6, 11.75, 2.3, 0, 'slate'],
-  [3, 4.6, 0.6, 26.5, 2.3, 0, 'slate'],
-  // Site A (west) and site B (east): low walls, pillars, containers.
-  [8, 2.6, 0.6, -22, 1.3, -8, 'slate'],
-  [0.6, 2.6, 6, -26, 1.3, -12, 'slate'],
-  [1.2, 3.2, 1.2, -24, 1.6, -14.5, 'concrete'],
-  [1.2, 3.2, 1.2, -18, 1.6, -14.5, 'concrete'],
-  [6, 2.6, 2.4, -12, 1.3, -12, 'rust'],
-  [8, 2.6, 0.6, 22, 1.3, -8, 'slate'],
-  [0.6, 2.6, 6, 26, 1.3, -12, 'slate'],
-  [1.2, 3.2, 1.2, 24, 1.6, -14.5, 'concrete'],
-  [1.2, 3.2, 1.2, 18, 1.6, -14.5, 'concrete'],
-  [6, 2.6, 2.4, 12, 1.3, -12, 'rust'],
-  // Mid-north container blocks the long sightline through the doors.
-  [4, 2.6, 2.4, 0, 1.3, -8, 'teal'],
-  // Pillars and crates down the three lanes.
-  [1.2, 3.2, 1.2, -8, 1.6, -4, 'concrete'],
-  [1.2, 3.2, 1.2, 8, 1.6, -4, 'concrete'],
-  [1.2, 3.2, 1.2, -8, 1.6, 12, 'concrete'],
-  [1.2, 3.2, 1.2, 8, 1.6, 12, 'concrete'],
-  [1.6, 1.1, 1.6, -6, 0.55, 6, 'rust'],
-  [1.6, 1.1, 1.6, 6, 0.55, 6, 'rust'],
-  [2.4, 1.1, 1.2, -6, 0.55, 10, 'slate'],
-  [1.6, 1.1, 1.6, -16, 0.55, 4, 'slate'],
-  [1.6, 1.1, 1.6, 16, 0.55, 4, 'slate'],
-  [1.2, 1.1, 3.6, -22, 0.55, -2, 'slate'],
-  [1.2, 1.1, 3.6, 22, 0.55, -2, 'slate'],
-  [3.6, 1.1, 1.2, -14, 0.55, -8, 'slate'],
-  [3.6, 1.1, 1.2, 14, 0.55, -8, 'slate'],
-  // Attacker-side cover and the spawn shelter.
-  [6, 2.6, 2.4, -14, 1.3, 14, 'teal'],
-  [6, 2.6, 2.4, 14, 1.3, 14, 'teal'],
-];
 
 // Bomb sites: name, centre, half-size of the plant zone.
 export const SITES = [
@@ -76,17 +37,22 @@ export const EDGES = [
   [0, 1], [0, 2], [0, 3], [1, 3], [2, 3], [1, 4], [2, 5], [3, 8],
   [4, 6], [5, 7], [4, 8], [5, 8], [6, 9], [7, 10],
   [9, 11], [10, 12], [11, 13], [12, 13],
-  [11, 21], [21, 14], [12, 22], [22, 15], [14, 16], [15, 17], [14, 18],
+  [11, 21], [21, 14], [12, 22], [22, 15], [14, 18],
   [15, 19], [16, 18], [17, 19], [18, 20], [19, 20], [16, 20], [17, 20],
   [3, 4], [3, 5],
 ];
+
+const WALL_HEIGHT = 4.6;
+const LOW_HEIGHT = 2.6;
+const PILLAR_HEIGHT = 3.2;
+const CRATE_HEIGHT = 1.1;
 
 export function createMap(scene) {
   const group = new THREE.Group();
   scene.add(group);
   const materials = {};
-  for (const name of Object.keys(PALETTE)) {
-    if (name === 'sky' || name === 'ink' || name === 'dark' || name === 'muted' || name === 'accent' || name === 'vanguard' || name === 'ember') continue;
+  const structural = ['sand', 'sandDark', 'concrete', 'slate', 'rust', 'teal'];
+  for (const name of structural) {
     materials[name] = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE[name]), roughness: 0.92, metalness: 0.03 });
   }
   materials.accent = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.accent), roughness: 0.55, metalness: 0.1 });
@@ -103,7 +69,58 @@ export function createMap(scene) {
     shootables.push(mesh);
     return mesh;
   }
-  for (const b of BOXES) box(b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+  // One helper per kind: the height is the kind's, the caller only places it.
+  const floor = () => box(57, 0.4, 41, 0, -0.2, 0, 'sand');
+  const sideWall = (x) => box(0.4, WALL_HEIGHT, 41, x, WALL_HEIGHT / 2, 0, 'concrete');
+  const endWall = (z) => box(57, WALL_HEIGHT, 0.4, 0, WALL_HEIGHT / 2, z, 'concrete');
+  const midWall = (w, x) => box(w, WALL_HEIGHT, 0.6, x, WALL_HEIGHT / 2, 0, 'slate');
+  const lowWall = (w, x, z, material) => box(w, LOW_HEIGHT, 0.6, x, LOW_HEIGHT / 2, z, material);
+  const lowWallZ = (d, x, z, material) => box(0.6, LOW_HEIGHT, d, x, LOW_HEIGHT / 2, z, material);
+  const pillar = (x, z, material = 'concrete') => box(1.2, PILLAR_HEIGHT, 1.2, x, PILLAR_HEIGHT / 2, z, material);
+  const container = (w, d, x, z, material) => box(w, LOW_HEIGHT, d, x, LOW_HEIGHT / 2, z, material);
+  const crate = (w, d, x, z, material) => box(w, CRATE_HEIGHT, d, x, CRATE_HEIGHT / 2, z, material);
+
+  // Floor and the four outer walls.
+  floor();
+  sideWall(-28.2);
+  sideWall(28.2);
+  endWall(-20.2);
+  endWall(20.2);
+  // Mid wall (z = 0) with three gaps: A connector, mid doors, B connector.
+  midWall(3, -26.5);
+  midWall(18.5, -11.75);
+  midWall(18.5, 11.75);
+  midWall(3, 26.5);
+  // Site A (west) and site B (east): low walls, pillars, containers.
+  lowWall(8, -22, -8, 'slate');
+  lowWallZ(6, -26, -12, 'slate');
+  pillar(-24, -14.5);
+  pillar(-18, -14.5);
+  container(6, 2.4, -12, -12, 'rust');
+  lowWall(8, 22, -8, 'slate');
+  lowWallZ(6, 26, -12, 'slate');
+  pillar(24, -14.5);
+  pillar(18, -14.5);
+  container(6, 2.4, 12, -12, 'rust');
+  // Mid-north container blocks the long sightline through the doors.
+  container(4, 2.4, 0, -8, 'teal');
+  // Pillars and crates down the three lanes.
+  pillar(-8, -4);
+  pillar(8, -4);
+  pillar(-8, 12);
+  pillar(8, 12);
+  crate(1.6, 1.6, -6, 6, 'rust');
+  crate(1.6, 1.6, 6, 6, 'rust');
+  crate(2.4, 1.2, -6, 10, 'slate');
+  crate(1.6, 1.6, -16, 4, 'slate');
+  crate(1.6, 1.6, 16, 4, 'slate');
+  crate(1.2, 3.6, -22, -2, 'slate');
+  crate(1.2, 3.6, 22, -2, 'slate');
+  crate(3.6, 1.2, -14, -8, 'slate');
+  crate(3.6, 1.2, 14, -8, 'slate');
+  // Attacker-side cover and the spawn shelter.
+  container(6, 2.4, -14, 14, 'teal');
+  container(6, 2.4, 14, 14, 'teal');
 
   // Site decals: flat tinted ground planes, and a tall site pole to spot at range.
   for (const site of SITES) {
